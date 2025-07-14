@@ -32,9 +32,7 @@ Streams H.264 video via hardware-accelerated `libcamera-vid` and `ffmpeg`, ideal
 Run this on a fresh Raspberry Pi OS Lite install:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/4ddict/RTSPPI/main/install_rtspcam.sh -o install_rtspcam.sh
-chmod +x install_rtspcam.sh
-sudo ./install_rtspcam.sh
+curl -fsSL https://raw.githubusercontent.com/4ddict/RTSPPI/main/install_rtspcam.sh -o install_rtspcam.sh && chmod +x install_rtspcam.sh && sudo ./install_rtspcam.sh
 ```
 
 ---
