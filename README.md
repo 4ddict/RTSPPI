@@ -56,7 +56,7 @@ _Example:_
 
 To change resolution, bitrate, or FPS:
 
-1. Edit `/opt/rtspcam/start_stream.sh`
+1. Edit `/etc/systemd/system/rtspcam.service`
 2. Change these lines:
 
 ```bash
