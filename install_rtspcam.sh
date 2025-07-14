@@ -80,5 +80,7 @@ sudo systemctl daemon-reload
 sudo systemctl enable mediamtx.service rtspcam.service
 sudo systemctl start mediamtx.service rtspcam.service
 
+PI_IP=$(hostname -I | awk '{print $1}')
 echo "✅ All done!"
-echo "📺 Your RTSP stream is available at: rtsp://<your_pi_ip>:8554/live.sdp"
+echo "📺 Your RTSP stream is available at: rtsp://$PI_IP:8554/live.sdp"
+
