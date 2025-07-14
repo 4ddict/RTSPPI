@@ -1,86 +1,55 @@
 #!/bin/bash
 
-set -e
+echo "📦 Updating and installing with minimal dependencies..."
 
-SERVICE_NAME="rtspcam"
-INSTALL_DIR="/opt/$SERVICE_NAME"
-STREAM_PORT=8554
-
-# === Uninstall logic ===
-if [[ "$1" == "--uninstall" ]]; then
-    echo "> Removing RTSP camera service..."
-    sudo systemctl stop $SERVICE_NAME.service || true
-    sudo systemctl disable $SERVICE_NAME.service || true
-    sudo rm -f /etc/systemd/system/$SERVICE_NAME.service
-    sudo rm -rf "$INSTALL_DIR"
-    sudo rm -f /usr/local/bin/mediamtx
-    echo "✅ Uninstalled successfully."
-    exit 0
-fi
-
-# === Reinstall logic ===
-if [[ "$1" == "--reinstall" ]]; then
-    bash "$0" --uninstall
-    bash "$0"
-    exit 0
-fi
-
-# === Ensure required tools ===
-echo "> Installing dependencies..."
 sudo apt update
-sudo apt install -y libcamera-apps ffmpeg curl tar
+sudo apt install -y --no-install-recommends \
+    curl \
+    ffmpeg \
+    rpicam-apps \
+    libcamera-apps \
+    libcamera0 \
+    libavcodec59 \
+    libavformat59 \
+    libavutil57 \
+    libswscale6
 
-# === Install mediamtx (RTSP server) ===
-echo "> Installing RTSP server (mediamtx)..."
-TMP_DIR=$(mktemp -d)
-cd "$TMP_DIR"
-curl -L -o mediamtx.tar.gz https://github.com/bluenviron/mediamtx/releases/latest/download/mediamtx_linux_arm64.tar.gz
-tar -xvzf mediamtx.tar.gz
-sudo mv mediamtx /usr/local/bin/
-cd ~
-sudo rm -rf "$TMP_DIR"
+echo "✅ Dependencies installed"
 
-# === Set up stream script ===
-echo "> Setting up streaming service..."
-sudo mkdir -p "$INSTALL_DIR"
+echo "📂 Creating RTSP stream script..."
 
-cat <<EOF | sudo tee "$INSTALL_DIR/stream.sh" > /dev/null
+cat <<EOF | sudo tee /usr/local/bin/start_rtspcam.sh > /dev/null
 #!/bin/bash
-/usr/local/bin/mediamtx &
-sleep 1
-libcamera-vid --width 1280 --height 720 --framerate 25 --bitrate 4000000 --inline --codec h264 -t 0 -o - | \
-ffmpeg -re -i - -vcodec copy -f rtsp rtsp://localhost:$STREAM_PORT/cam
+libcamera-vid \\
+  --width 1280 --height 720 --framerate 25 \\
+  --bitrate 4000000 --inline --codec h264 -t 0 -o - | \\
+  ffmpeg -re -i - -vcodec copy -f rtsp rtsp://0.0.0.0:8554/live.sdp
 EOF
 
-sudo chmod +x "$INSTALL_DIR/stream.sh"
+sudo chmod +x /usr/local/bin/start_rtspcam.sh
 
-# === Create systemd service ===
-cat <<EOF | sudo tee /etc/systemd/system/$SERVICE_NAME.service > /dev/null
+echo "🛠 Creating systemd service..."
+
+cat <<EOF | sudo tee /etc/systemd/system/rtspcam.service > /dev/null
 [Unit]
 Description=RTSP Camera Streamer
 After=network.target
 
 [Service]
-ExecStart=$INSTALL_DIR/stream.sh
+ExecStart=/usr/local/bin/start_rtspcam.sh
 Restart=always
 User=pi
+Group=video
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-# === Enable service ===
+echo "🔄 Enabling service to start on boot..."
 sudo systemctl daemon-reexec
 sudo systemctl daemon-reload
-sudo systemctl enable $SERVICE_NAME.service
-sudo systemctl start $SERVICE_NAME.service
+sudo systemctl enable rtspcam.service
+sudo systemctl start rtspcam.service
 
-# === Output ===
-IP=$(hostname -I | awk '{print $1}')
-echo "===================================="
-echo " ✅  Installed and Running!"
-echo " 🔄  Reboot recommended"
-echo " 📡  RTSP Stream: rtsp://$IP:$STREAM_PORT/cam"
-echo " 🧹  Uninstall: ./install_rtspcam.sh --uninstall"
-echo " ♻️  Reinstall: ./install_rtspcam.sh --reinstall"
-echo "===================================="
+echo "✅ RTSP camera service started!"
+echo "🌐 Stream URL: rtsp://<your-pi-ip>:8554/live.sdp"
