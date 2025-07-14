@@ -1,67 +1,40 @@
 #!/bin/bash
+
 set -e
 
-echo "📷 Installing RTSP Camera Streamer (fully automated)..."
-
-# Ensure script is run as root
-if [[ $EUID -ne 0 ]]; then
-  echo "❌ Please run this script as root (use sudo)"
-  exit 1
-fi
-
-echo "📦 Updating packages..."
-apt update -y
+echo "📦 Updating package lists..."
+sudo apt update -y
 
 echo "📦 Installing minimal dependencies..."
-apt install --no-install-recommends -y \
-  libcamera0 \
-  libcamera-ipa \
-  rpicam-apps \
-  ffmpeg \
-  curl \
-  tar
+sudo apt install -y --no-install-recommends \
+  libcamera-ipa libcamera0.5 \
+  ffmpeg curl tar
 
-# Set up installation directory
-INSTALL_DIR="/opt/rtspcam"
-mkdir -p "$INSTALL_DIR"
-cd "$INSTALL_DIR"
+echo "📦 Downloading and installing MediaMTX RTSP server..."
+cd /opt
+sudo curl -L -o mediamtx.tar.gz https://github.com/bluenviron/mediamtx/releases/latest/download/mediamtx_linux_arm64.tar.gz
+sudo tar -xzf mediamtx.tar.gz
+sudo rm mediamtx.tar.gz
 
-echo "🌐 Downloading MediaMTX (RTSP server)..."
-ARCH="arm64"
-MTX_URL="https://github.com/bluenviron/mediamtx/releases/latest/download/mediamtx_linux_${ARCH}.tar.gz"
-
-curl -fsSL "$MTX_URL" -o mediamtx.tar.gz
-
-if ! file mediamtx.tar.gz | grep -q "gzip compressed"; then
-  echo "❌ Downloaded MediaMTX file is not a valid gzip archive"
-  rm -f mediamtx.tar.gz
-  exit 1
-fi
-
-tar -xvzf mediamtx.tar.gz
-rm mediamtx.tar.gz
-chmod +x mediamtx
-
-# Optional: create default MediaMTX config (but it's optional in newer versions)
-cat <<EOF > "$INSTALL_DIR/mediamtx.yml"
+# Create RTSP config
+cat <<EOF | sudo tee /opt/mediamtx/mediamtx.yml > /dev/null
+serverProtocols: [udp, tcp]
 paths:
   all:
     source: rtsp://localhost:8554/live.sdp
     sourceProtocol: udp
 EOF
 
-# Create systemd service
-SERVICE_FILE="/etc/systemd/system/rtspcam.service"
-echo "🛠 Creating systemd service at $SERVICE_FILE"
+echo "📄 Creating systemd service..."
 
-cat <<EOF > "$SERVICE_FILE"
+# Create systemd unit for RTSP camera stream
+sudo tee /etc/systemd/system/rtspcam.service > /dev/null <<EOF
 [Unit]
-Description=RTSP Camera Streamer (libcamera-vid + ffmpeg + MediaMTX)
+Description=RTSP Camera Stream (libcamera + ffmpeg + MediaMTX)
 After=network.target
 
 [Service]
-ExecStart=/bin/bash -c 'libcamera-vid --width 1280 --height 720 --framerate 25 --bitrate 4000000 --inline --codec h264 -t 0 -o - | ffmpeg -re -i - -vcodec copy -f rtsp rtsp://127.0.0.1:8554/live.sdp &>/dev/null & sleep 2 && $INSTALL_DIR/mediamtx'
-WorkingDirectory=$INSTALL_DIR
+ExecStart=/bin/bash -c 'libcamera-vid --width 1280 --height 720 --framerate 25 --bitrate 4000000 --inline --codec h264 -t 0 -o - | ffmpeg -re -i - -vcodec copy -f rtsp rtsp://127.0.0.1:8554/live.sdp'
 Restart=always
 User=pi
 
@@ -69,15 +42,28 @@ User=pi
 WantedBy=multi-user.target
 EOF
 
-echo "🔄 Enabling and starting service..."
-systemctl daemon-reexec
-systemctl daemon-reload
-systemctl enable rtspcam.service
-systemctl start rtspcam.service
+echo "📄 Creating systemd service for MediaMTX..."
 
-echo ""
-echo "✅ RTSP Camera is installed and running!"
-echo ""
-echo "🛰 RTSP Stream URL: rtsp://<YOUR_PI_IP>:8554/live.sdp"
-echo "🔁 Service: rtspcam.service (auto-starts on boot)"
-echo ""
+# Create systemd unit for MediaMTX server
+sudo tee /etc/systemd/system/mediamtx.service > /dev/null <<EOF
+[Unit]
+Description=MediaMTX RTSP Server
+After=network.target
+
+[Service]
+WorkingDirectory=/opt/mediamtx
+ExecStart=/opt/mediamtx/mediamtx
+Restart=always
+User=pi
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+echo "🚀 Enabling and starting services..."
+sudo systemctl daemon-reexec
+sudo systemctl daemon-reload
+sudo systemctl enable rtspcam.service mediamtx.service
+sudo systemctl start rtspcam.service mediamtx.service
+
+echo "✅ RTSP Camera is now running on rtsp://<your_pi_ip>:8554/live.sdp"
