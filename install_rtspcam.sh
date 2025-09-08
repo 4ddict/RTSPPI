@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
-# ┃  RTSPPI — Polished Installer (Pi Zero 2 W friendly)         ┃
+# ┃  RTSPPI — Installer (Pi Zero 2 W friendly)                  ┃
 # ┃  rpicam-vid/libcamera-vid → ffmpeg (push) → MediaMTX (RTSP) ┃
 # ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
 set -euo pipefail
@@ -26,18 +26,48 @@ log(){ echo -e "$1 $2"; }; ok(){ log "${CHECK}" "$1"; }; err(){ log "${CROSS}" "
 # ── Defaults & flags ───────────────────────────────────────────
 WIDTH=1280; HEIGHT=720; FPS=25; BITRATE=2000000
 PORT=8554; PATH_SEGMENT="live"
-SERVICE_NAME="rtspcam"; RUN_DIR="/opt/${SERVICE_NAME}"; RUN_SCRIPT="${RUN_DIR}/run.sh"; UNIT_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
-MTX_SERVICE="mediamtx"; MTX_DIR="/opt/${MTX_SERVICE}"; MTX_BIN="${MTX_DIR}/mediamtx"; MTX_UNIT="/etc/systemd/system/${MTX_SERVICE}.service"; MTX_CFG="${MTX_DIR}/mediamtx.yml"
+
+SERVICE_NAME="rtspcam"
+RUN_DIR="/opt/${SERVICE_NAME}"
+RUN_SCRIPT="${RUN_DIR}/run.sh"
+UNIT_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+
+MTX_SERVICE="mediamtx"
+MTX_DIR="/opt/${MTX_SERVICE}"
+MTX_BIN="${MTX_DIR}/mediamtx"
+MTX_UNIT="/etc/systemd/system/${MTX_SERVICE}.service"
+MTX_CFG="${MTX_DIR}/mediamtx.yml"
+
+# If you want to pin/override the MediaMTX download URL, set MEDIAMTX_URL env var before running.
+# Example: MEDIAMTX_URL=https://github.com/.../mediamtx_v1.14.0_linux_arm64.tar.gz sudo bash install_rtspcam.sh
+MEDIAMTX_URL_DEFAULT_ARM64="https://github.com/bluenviron/mediamtx/releases/download/v1.14.0/mediamtx_v1.14.0_linux_arm64.tar.gz"
+MEDIAMTX_URL_DEFAULT_ARMV7="https://github.com/bluenviron/mediamtx/releases/download/v1.14.0/mediamtx_v1.14.0_linux_armv7.tar.gz"
+
 ACTION="install"
 
 print_help(){ cat <<EOF
 ${BOLD}RTSPPI Installer${RESET}
-Install:   sudo bash $0 [--width 1280] [--height 720] [--fps 25] [--bitrate 2000000] [--port 8554] [--path live]
-Status:    sudo bash $0 --status
-Restart:   sudo bash $0 --restart
-Uninstall: sudo bash $0 --uninstall
+
+Install (default):
+  sudo bash $0 [--width 1280] [--height 720] [--fps 25] [--bitrate 2000000] [--port 8554] [--path live]
+
+Maintenance:
+  sudo bash $0 --status | --restart | --uninstall
+
+Flags:
+  --width N        (default ${WIDTH})
+  --height N       (default ${HEIGHT})
+  --fps N          (default ${FPS})
+  --bitrate N      bits/sec (default ${BITRATE})
+  --port N         RTSP port (default ${PORT})
+  --path NAME      RTSP path (default ${PATH_SEGMENT})
+  -h, --help       Show this help
+
+Env override:
+  MEDIAMTX_URL=<direct tar.gz url>  (e.g. the arm64 link you provided)
 EOF
 }
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --width) WIDTH="${2:-}"; shift 2;;
@@ -57,11 +87,11 @@ done
 # ── Helpers ────────────────────────────────────────────────────
 require_root(){ [[ $EUID -eq 0 ]] || { err "Run as root: sudo bash $0"; exit 1; }; }
 require_apt(){ command -v apt-get >/dev/null 2>&1 || { err "Needs apt-get (Debian/Raspberry Pi OS)"; exit 1; }; }
-arch_name(){
+arch(){
   case "$(uname -m)" in
-    aarch64|arm64) echo "arm64" ;;  # Pi 64-bit
-    armv7l)        echo "armv7" ;;  # Pi 32-bit
-    *)             echo "arm64" ;;
+    aarch64|arm64) echo "arm64";;
+    armv7l)        echo "armv7";;
+    *)             echo "arm64";;
   esac
 }
 
@@ -78,51 +108,30 @@ cleanup_old(){
   ok "Old units removed"
 }
 
-# ── Install MediaMTX (download OR build-from-source fallback) ──
+# ── Install MediaMTX (uses direct link for your arch, with override) ───────
 install_mediamtx(){
   step "Installing MediaMTX (RTSP server)"
   install -d -m 0755 "${MTX_DIR}"
   apt-get update -y >/dev/null
-  apt-get install -y --no-install-recommends curl ca-certificates unzip >/dev/null
+  apt-get install -y --no-install-recommends curl ca-certificates >/dev/null
 
-  local ARCH="$(arch_name)"
-  local PAGE
-  # Try scraping releases for a matching asset (works when naming is stable)
-  if curl -fsSL https://github.com/bluenviron/mediamtx/releases -o /tmp/mediamtx.releases.html ; then
-    PAGE="$(cat /tmp/mediamtx.releases.html)"
-  else
-    PAGE=""
-  fi
-
-  local URL_TGZ="" URL_ZIP=""
-  if [[ -n "$PAGE" ]]; then
-    # Preferred current naming: mediamtx_vX.Y.Z_linux_arm64(.tar.gz|.zip) or armv7
-    URL_TGZ="$(echo "$PAGE" | grep -Eo "https://github.com/bluenviron/mediamtx/releases/download/[^/]+/mediamtx_v[0-9\.]+_linux_${ARCH}\.tar\.gz" | head -n1 || true)"
-    URL_ZIP="$(echo "$PAGE" | grep -Eo "https://github.com/bluenviron/mediamtx/releases/download/[^/]+/mediamtx_v[0-9\.]+_linux_${ARCH}\.zip" | head -n1 || true)"
-    # Legacy arm64v8 fallback if nothing found
-    if [[ -z "$URL_TGZ$URL_ZIP" && "${ARCH}" = "arm64" ]]; then
-      URL_TGZ="$(echo "$PAGE" | grep -Eo "https://github.com/bluenviron/mediamtx/releases/download/[^/]+/mediamtx_v[0-9\.]+_linux_arm64v8\.tar\.gz" | head -n1 || true)"
-      URL_ZIP="$(echo "$PAGE" | grep -Eo "https://github.com/bluenviron/mediamtx/releases/download/[^/]+/mediamtx_v[0-9\.]+_linux_arm64v8\.zip" | head -n1 || true)"
+  local A; A="$(arch)"
+  local URL="${MEDIAMTX_URL:-}"
+  if [[ -z "${URL}" ]]; then
+    if [[ "${A}" = "arm64" ]]; then
+      URL="${MEDIAMTX_URL_DEFAULT_ARM64}"
+    else
+      URL="${MEDIAMTX_URL_DEFAULT_ARMV7}"
     fi
   fi
 
-  if [[ -n "${URL_TGZ}" ]]; then
-    echo "➜ Fetching ${URL_TGZ}"
-    curl -fsSL --retry 3 -o "${MTX_DIR}/mediamtx.tar.gz" "${URL_TGZ}"
-    tar -xzf "${MTX_DIR}/mediamtx.tar.gz" -C "${MTX_DIR}"
-  elif [[ -n "${URL_ZIP}" ]]; then
-    echo "➜ Fetching ${URL_ZIP}"
-    curl -fsSL --retry 3 -o "${MTX_DIR}/mediamtx.zip" "${URL_ZIP}"
-    unzip -o "${MTX_DIR}/mediamtx.zip" -d "${MTX_DIR}" >/dev/null
-  else
-    wrn "No prebuilt MediaMTX asset found for ${ARCH}. Falling back to building from source."
-    # Build from source with Go (fast & reliable on Pi)
-    apt-get install -y --no-install-recommends golang git >/dev/null
-    # Use module install; place binary directly in /opt/mediamtx
-    GOBIN="${MTX_DIR}" CGO_ENABLED=0 go install github.com/bluenviron/mediamtx@latest
-  fi
+  echo "➜ Downloading MediaMTX for ${A}"
+  echo "   ${URL}"
+  curl -fL --retry 3 --connect-timeout 15 -o "${MTX_DIR}/mediamtx.tgz" "${URL}"
+  tar -xzf "${MTX_DIR}/mediamtx.tgz" -C "${MTX_DIR}"
+  rm -f "${MTX_DIR}/mediamtx.tgz"
 
-  [[ -x "${MTX_BIN}" ]] || { err "mediamtx binary missing after install"; exit 1; }
+  [[ -x "${MTX_BIN}" ]] || { err "mediamtx binary missing after extract"; exit 1; }
   chmod +x "${MTX_BIN}"
 
   # Minimal config
@@ -167,7 +176,8 @@ do_install(){
   step "Installing packages (ffmpeg + camera apps)"
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -y >/dev/null
-  apt-get install -y --no-install-recommends ffmpeg rpicam-apps || apt-get install -y --no-install-recommends ffmpeg libcamera-apps
+  apt-get install -y --no-install-recommends ffmpeg rpicam-apps || \
+  apt-get install -y --no-install-recommends ffmpeg libcamera-apps
   ok "Installed ffmpeg and camera tools"
 
   install_mediamtx
