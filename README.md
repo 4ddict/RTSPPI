@@ -35,9 +35,7 @@ Works seamlessly with **Scrypted, Home Assistant, VLC, ffmpeg, and more**.
 Run this on a fresh Raspberry Pi OS Lite install:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/4ddict/RTSPPI/main/install_rtspcam.sh -o install_rtspcam.sh \
-  && chmod +x install_rtspcam.sh \
-  && sudo ./install_rtspcam.sh
+curl -fsSL https://raw.githubusercontent.com/4ddict/RTSPPI/main/install_rtspcam.sh -o install_rtspcam.sh && chmod +x install_rtspcam.sh && sudo ./install_rtspcam.sh
 ```
 
 This will:
