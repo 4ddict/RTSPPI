@@ -1,19 +1,22 @@
 # 📡 RTSPPi – RTSP Camera Streamer for Raspberry Pi
 
-**High-performance, headless RTSP streaming from Raspberry Pi camera modules**  
-Streams H.264 video via hardware-accelerated `libcamera-vid` and `ffmpeg`, ideal for Scrypted, Home Assistant, VLC, and more.
+**High-performance, low-latency RTSP streaming from Raspberry Pi camera modules**  
+Streams H.264 video via hardware-accelerated `rpicam-vid`/`libcamera-vid` → `ffmpeg` → `MediaMTX`.  
+Works seamlessly with **Scrypted, Home Assistant, VLC, ffmpeg, and more**.
 
-> ✅ Optimized for Raspberry Pi Zero 2 W running Raspberry Pi OS Lite (Bookworm, kernel 6.12)
+> ✅ Optimized for Raspberry Pi Zero 2 W running Raspberry Pi OS Lite (Bookworm, kernel 6.12)  
+> ✅ Uses [MediaMTX](https://github.com/bluenviron/mediamtx) as the RTSP server for compatibility and stability
 
 ---
 
 ## 🎯 Project Goals
 
-- 🔄 RTSP stream using H.264 (GPU-accelerated)
-- ⚡️ Minimal resource usage (perfect for Pi Zero 2 W)
-- 🚫 No browser/UI overhead — just raw stream
-- 🧠 Headless operation with `systemd` autostart
-- 💾 Easily adjustable settings (resolution, bitrate, FPS)
+- 📡 RTSP stream using H.264 (GPU-accelerated)  
+- ⚡️ Low latency with tuned FFmpeg flags (`-fflags nobuffer -flags low_delay -muxdelay 0`)  
+- 🛡️ Robust server via MediaMTX (TCP only, wildcard paths)  
+- 🔄 Self-restarting via `systemd` on boot or failure  
+- 💾 Easily adjustable settings (resolution, bitrate, FPS, keyframe interval)  
+- 🚫 No browser/UI overhead — just raw RTSP stream  
 
 ---
 
@@ -32,8 +35,16 @@ Streams H.264 video via hardware-accelerated `libcamera-vid` and `ffmpeg`, ideal
 Run this on a fresh Raspberry Pi OS Lite install:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/4ddict/RTSPPI/main/install_rtspcam.sh -o install_rtspcam.sh && chmod +x install_rtspcam.sh && sudo ./install_rtspcam.sh
+curl -fsSL https://raw.githubusercontent.com/4ddict/RTSPPI/main/install_rtspcam.sh -o install_rtspcam.sh \
+  && chmod +x install_rtspcam.sh \
+  && sudo ./install_rtspcam.sh
 ```
+
+This will:
+
+- Install dependencies (`ffmpeg`, camera apps, system tools)  
+- Download and configure **MediaMTX** RTSP server  
+- Set up **`rtspcam` service** to auto-start and push video into MediaMTX  
 
 ---
 
@@ -41,14 +52,20 @@ curl -fsSL https://raw.githubusercontent.com/4ddict/RTSPPI/main/install_rtspcam.
 
 Once installed, your Pi will automatically stream on boot.
 
-Open the stream in VLC, Scrypted, ffmpeg, etc.:
+Open the stream in **VLC, Scrypted, ffmpeg, Home Assistant**, etc.:
 
 ```
+rtsp://<your-pi-ip>:8554/live
 rtsp://<your-pi-ip>:8554/live.sdp
 ```
 
-_Example:_  
-`rtsp://192.168.0.221:8554/live.sdp`
+💡 Both URLs are valid (wildcard path config).  
+
+For VLC, force TCP for stability:
+
+```bash
+vlc --rtsp-tcp rtsp://<your-pi-ip>:8554/live.sdp
+```
 
 ---
 
@@ -63,12 +80,14 @@ To change resolution, bitrate, or FPS:
 WIDTH=1280
 HEIGHT=720
 FPS=25
-BITRATE=4000000
+BITRATE=2000000
+INTRA=25
 ```
 
-3. Restart the service:
+3. Apply changes:
 
 ```bash
+sudo systemctl daemon-reload
 sudo systemctl restart rtspcam
 ```
 
@@ -79,8 +98,10 @@ sudo systemctl restart rtspcam
 To fully remove RTSPPi:
 
 ```bash
-sudo systemctl disable --now rtspcam
-sudo rm -rf /opt/rtspcam /etc/systemd/system/rtspcam.service
+sudo systemctl disable --now rtspcam mediamtx
+sudo rm -rf /opt/rtspcam /opt/mediamtx \
+  /etc/systemd/system/rtspcam.service \
+  /etc/systemd/system/mediamtx.service
 sudo systemctl daemon-reload
 ```
 
@@ -88,30 +109,33 @@ sudo systemctl daemon-reload
 
 ## ✅ Features
 
-- ✅ Hardware-accelerated H.264 encoding via `libcamera-vid`
-- ✅ Live RTSP stream via `ffmpeg`
-- ✅ Auto-start on boot via `systemd`
-- ✅ Works with Scrypted, Home Assistant, VLC, ffmpeg
-- ✅ Lightweight and fast for Pi Zero 2 W
+- ✅ Hardware-accelerated H.264 via `rpicam-vid` / `libcamera-vid`  
+- ✅ Low-latency streaming (fast keyframes, tuned ffmpeg flags)  
+- ✅ MediaMTX RTSP server (TCP only, wildcard paths)  
+- ✅ Auto-start on boot via `systemd`  
+- ✅ Works with Scrypted, Home Assistant, VLC, ffmpeg  
+- ✅ Lightweight and reliable on Pi Zero 2 W  
 
 ---
 
 ## 🛠️ Troubleshooting
 
 - ❓ **Stream not loading?**
-  - Make sure port `8554` is not blocked
-  - Run: `sudo systemctl status rtspcam`
-  - Check logs: `journalctl -u rtspcam`
+  - Use the correct URL: `rtsp://<pi-ip>:8554/live` (or `/live.sdp`)
+  - Ensure TCP is used (add `--rtsp-tcp` in VLC)
+  - Run: `sudo systemctl status rtspcam mediamtx`
+  - Logs: `journalctl -u rtspcam -u mediamtx -n 50 --no-pager`
 
 - ❓ **Stream laggy?**
-  - Lower resolution (e.g. 960x540)
+  - Lower `WIDTH`/`HEIGHT`
   - Lower FPS or bitrate
+  - Adjust `INTRA` (keyframe interval) for smoother playback
 
 ---
 
 ## 👨‍💻 Author
 
-Made with 💻 + ❤️ by [**@4ddict**](https://github.com/4ddict)
+Made with 💻 + ❤️ by [**@4ddict**](https://github.com/4ddict)  
 
 Feel free to [open issues](https://github.com/4ddict/RTSPPI/issues) or contribute!
 
@@ -119,11 +143,11 @@ Feel free to [open issues](https://github.com/4ddict/RTSPPI/issues) or contribut
 
 ## 🧪 Tested
 
-- ✅ Raspberry Pi Zero 2 W
-- ✅ Raspberry Pi OS Lite (Bookworm, 2025)
-- ✅ Camera Modules: OV5647, V2, HQ
-- ✅ Works with:
-  - Scrypted
-  - VLC
-  - ffmpeg
-  - Home Assistant
+- ✅ Raspberry Pi Zero 2 W  
+- ✅ Raspberry Pi OS Lite (Bookworm, 2025)  
+- ✅ Camera Modules: OV5647, V2, HQ  
+- ✅ Works with:  
+  - Scrypted  
+  - VLC (with `--rtsp-tcp`)  
+  - ffmpeg  
+  - Home Assistant  
