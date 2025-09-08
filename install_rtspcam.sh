@@ -1,20 +1,19 @@
 #!/usr/bin/env bash
 # ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
 # ┃  RTSPPI — Polished Installer (Pi Zero 2 W friendly)         ┃
-# ┃  libcamera-vid  →  ffmpeg (RTSP server) under systemd       ┃
+# ┃  rpicam-vid/libcamera-vid → ffmpeg (RTSP server) + systemd  ┃
 # ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
 # Usage:
 #   sudo bash install_rtspcam.sh [--width 1280] [--height 720] \
 #        [--fps 25] [--bitrate 2000000] [--port 8554] [--path live.sdp]
 #
-#   Other commands:
-#     --status       Show service status
-#     --restart      Restart the service
-#     --uninstall    Remove everything this script installed
-#     -h | --help    Show help
+# Maintenance:
+#   sudo bash install_rtspcam.sh --status
+#   sudo bash install_rtspcam.sh --restart
+#   sudo bash install_rtspcam.sh --uninstall
 #
 # After install:  rtsp://<pi-ip>:<port>/<path>
-# Default (tuned for Pi Zero 2 W): 1280x720 @ 25fps, 2Mbps, TCP
+# Defaults (Zero 2 W friendly): 1280x720 @ 25fps, 2 Mbps, TCP
 set -euo pipefail
 
 # ───────────────────────── Appearance ──────────────────────────
@@ -31,15 +30,16 @@ INFO="${BLUE}ℹ${RESET}"
 WARN="${YELLOW}⚠${RESET}"
 
 banner() {
-  echo -e "${BOLD}${CYAN}
+  cat <<'BANNER'
   _____ _______ _____ _____  _____ _____ 
  |  __ \__   __/ ____|  __ \|  __ \_   _|
  | |__) | | | | (___ | |__) | |__) || |  
  |  _  /  | |  \___ \|  ___/|  ___/ | |  
  | | \ \  | |  ____) | |    | |    _| |_ 
  |_|  \_\ |_| |_____/|_|    |_|   |_____|
-                                         ${RESET}
-        ${DIM}RTSP camera for Raspberry Pi (Zero 2 W ready)${RESET}\n"
+                                         
+BANNER
+  echo -e "        ${DIM}RTSP camera for Raspberry Pi (Zero 2 W ready)${RESET}\n"
 }
 
 log() { echo -e "$1 $2"; }
@@ -53,7 +53,7 @@ step(){ log "${ARROW}" "${BOLD}$1${RESET}"; }
 WIDTH=1280
 HEIGHT=720
 FPS=25
-BITRATE=2000000      # 2 Mbps default—friendly for Zero 2 W Wi-Fi
+BITRATE=2000000      # 2 Mbps default—smooth over 2.4GHz Wi-Fi
 PORT=8554
 PATH_SEGMENT="live.sdp"
 
@@ -120,13 +120,8 @@ require_apt() {
 
 detect_pi() {
   local model="Unknown"
-  if [[ -f /proc/device-tree/model ]]; then
-    model="$(tr -d '\0' </proc/device-tree/model)"
-  fi
+  [[ -f /proc/device-tree/model ]] && model="$(tr -d '\0' </proc/device-tree/model)"
   inf "Detected device: ${BOLD}${model}${RESET}"
-  if echo "$model" | grep -qi "Raspberry Pi Zero 2"; then
-    ok "Optimizing defaults for Pi Zero 2 W ✔"
-  fi
 }
 
 # ────────────────────────── Actions ────────────────────────────
@@ -139,8 +134,10 @@ do_install() {
   step "Installing packages"
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -y >/dev/null
-  apt-get install -y --no-install-recommends ffmpeg libcamera-apps coreutils bash ca-certificates >/dev/null
-  ok "ffmpeg + libcamera-apps installed"
+  # Prefer rpicam-apps (Bookworm); fallback to libcamera-apps (older)
+  apt-get install -y --no-install-recommends ffmpeg rpicam-apps || \
+  apt-get install -y --no-install-recommends ffmpeg libcamera-apps
+  ok "ffmpeg + camera apps installed"
 
   step "Creating runtime directory"
   install -d -m 0755 "${RUN_DIR}"
@@ -151,6 +148,16 @@ do_install() {
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Choose the camera app available on this system
+if command -v rpicam-vid >/dev/null 2>&1; then
+  CAMBIN="rpicam-vid"
+elif command -v libcamera-vid >/dev/null 2>&1; then
+  CAMBIN="libcamera-vid"
+else
+  echo "ERROR: Neither rpicam-vid nor libcamera-vid found. Install rpicam-apps or libcamera-apps." >&2
+  exit 1
+fi
+
 WIDTH="${WIDTH:-1280}"
 HEIGHT="${HEIGHT:-720}"
 FPS="${FPS:-25}"
@@ -158,19 +165,18 @@ BITRATE="${BITRATE:-2000000}"
 PORT="${PORT:-8554}"
 PATH_SEGMENT="${PATH_SEGMENT:-live.sdp}"
 
-# libcamera-vid (HW H.264) → ffmpeg RTSP (listen)
-exec libcamera-vid \
+# Camera → ffmpeg (RTSP server). No 'exec' on the left side!
+# Use robust listen syntax: bind all interfaces with -listen 1
+"$CAMBIN" \
   -t 0 --inline -n \
   --width "$WIDTH" --height "$HEIGHT" \
   --framerate "$FPS" --bitrate "$BITRATE" \
   --codec h264 -o - \
 | ffmpeg -hide_banner -loglevel warning \
   -re -fflags +genpts \
-  -use_wallclock_as_timestamps 1 \
   -r "$FPS" -i pipe:0 \
   -c copy \
-  -f rtsp -rtsp_flags listen -rtsp_transport tcp \
-  "rtsp://0.0.0.0:${PORT}/${PATH_SEGMENT}"
+  -f rtsp -listen 1 "rtsp://:${PORT}/${PATH_SEGMENT}"
 EOS
   chmod +x "${RUN_SCRIPT}"
   ok "Runner at ${RUN_SCRIPT}"
@@ -178,18 +184,23 @@ EOS
   step "Creating systemd service"
   cat >"${UNIT_FILE}" <<EOF
 [Unit]
-Description=RTSP camera (libcamera-vid -> ffmpeg)
+Description=RTSP camera (rpicam-vid/libcamera-vid -> ffmpeg)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
+# Boot delay so nothing else grabs the camera right at boot
+ExecStartPre=/bin/sleep 3
+
+# Stream parameters (edit to taste)
 Environment=WIDTH=${WIDTH}
 Environment=HEIGHT=${HEIGHT}
 Environment=FPS=${FPS}
 Environment=BITRATE=${BITRATE}
 Environment=PORT=${PORT}
 Environment=PATH_SEGMENT=${PATH_SEGMENT}
+
 WorkingDirectory=${RUN_DIR}
 ExecStart=/bin/bash -lc '${RUN_SCRIPT}'
 
@@ -209,9 +220,13 @@ EOF
 
   step "Enabling service"
   systemctl daemon-reload
-  systemctl enable --now "${SERVICE_NAME}" >/dev/null
+  systemctl enable --now "${SERVICE_NAME}" >/dev/null || true
   sleep 1
-  systemctl is-active --quiet "${SERVICE_NAME}" && ok "Service started"
+  if systemctl is-active --quiet "${SERVICE_NAME}"; then
+    ok "Service started"
+  else
+    wrn "Service not active yet. Check logs with: journalctl -u ${SERVICE_NAME} -n 80 --no-pager"
+  fi
 
   # Firewall (optional)
   if command -v ufw >/dev/null 2>&1; then
@@ -227,8 +242,9 @@ EOF
   ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
   ip="${ip:-$(ip -4 addr show scope global 2>/dev/null | awk '/inet /{print $2}' | cut -d/ -f1 | head -n1)}"
   echo -e "${INFO} Stream URL: ${BOLD}rtsp://${ip:-<pi-ip>}:${PORT}/${PATH_SEGMENT}${RESET}"
+  echo -e "${INFO} Check listening: ${BOLD}ss -tlnp | grep ${PORT}${RESET}"
   echo -e "${INFO} Logs: ${BOLD}journalctl -fu ${SERVICE_NAME}${RESET}"
-  echo -e "${INFO} Change settings: ${BOLD}sudo systemctl edit ${SERVICE_NAME}${RESET} ${DIM}(or edit ${UNIT_FILE} and restart)${RESET}"
+  echo -e "${INFO} Change settings: ${BOLD}sudo systemctl edit ${SERVICE_NAME}${RESET} ${DIM}(or edit ${UNIT_FILE})${RESET}"
   echo -e "${INFO} Restart now: ${BOLD}sudo systemctl restart ${SERVICE_NAME}${RESET}"
   echo
   ok  "Done"
@@ -240,7 +256,7 @@ do_status() {
   step "Service status"
   systemctl --no-pager --full status "${SERVICE_NAME}" || true
   echo
-  echo -e "${INFO} Logs (tail): ${BOLD}journalctl -u ${SERVICE_NAME} -n 50 --no-pager${RESET}"
+  echo -e "${INFO} Logs (tail): ${BOLD}journalctl -u ${SERVICE_NAME} -n 80 --no-pager${RESET}"
 }
 
 do_restart() {
@@ -249,7 +265,7 @@ do_restart() {
   step "Restarting ${SERVICE_NAME}"
   systemctl restart "${SERVICE_NAME}"
   systemctl is-active --quiet "${SERVICE_NAME}" && ok "Service active"
-  echo -e "${INFO} Logs: ${BOLD}journalctl -fu ${SERVICE_NAME}${RESET}"
+  echo -e "${INFO} Live logs: ${BOLD}journalctl -fu ${SERVICE_NAME}${RESET}"
 }
 
 do_uninstall() {
