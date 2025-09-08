@@ -20,7 +20,7 @@ banner(){ cat <<'BANNER'
  |_|  \_\ |_| |_____/|_|    |_|   |_____|
                                          
 BANNER
-echo -e "        ${DIM}RTSP camera for Raspberry Pi (Zero 2 W ready)${RESET}\n"; }
+echo -e "${DIM}RTSP camera for Raspberry Pi (Zero 2 W ready)${RESET}\n"; }
 log(){ echo -e "$1 $2"; }; ok(){ log "${CHECK}" "$1"; }; step(){ log "${ARROW}" "$1"; }; err(){ log "${CROSS}" "$1"; }
 
 # ── Defaults (no downscaling) ─────────────────────────────────
