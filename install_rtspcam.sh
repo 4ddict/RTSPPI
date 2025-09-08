@@ -25,7 +25,7 @@ log(){ echo -e "$1 $2"; }; ok(){ log "${CHECK}" "$1"; }; step(){ log "${ARROW}" 
 
 # ── Defaults (no downscaling) ─────────────────────────────────
 WIDTH=1280; HEIGHT=720; FPS=25; BITRATE=2000000; INTRA=15
-PORT=8554; PATH_SEGMENT="live.sdp"  # default to .sdp for VLC/Scrypted compatibility
+PORT=8554; PATH_SEGMENT="live.sdp"  # default to .sdp for client compatibility
 SERVICE_NAME="rtspcam"
 RUN_DIR="/opt/${SERVICE_NAME}"
 RUN_SCRIPT="${RUN_DIR}/run.sh"
@@ -36,6 +36,11 @@ MTX_DIR="/opt/${MTX_SERVICE}"
 MTX_BIN="${MTX_DIR}/mediamtx"
 MTX_CFG="${MTX_DIR}/mediamtx.yml"
 MTX_UNIT="/etc/systemd/system/${MTX_SERVICE}.service"
+
+# Healthcheck timer/service
+HC_BIN="/usr/local/bin/rtsp-healthcheck.sh"
+HC_SERVICE="/etc/systemd/system/rtsp-healthcheck.service"
+HC_TIMER="/etc/systemd/system/rtsp-healthcheck.timer"
 
 ACTION="install"
 
@@ -87,10 +92,10 @@ cleanup_old(){
   step "Cleaning up old installations (if any)"
   systemctl disable --now "${SERVICE_NAME}" >/dev/null 2>&1 || true
   systemctl disable --now "${MTX_SERVICE}" >/dev/null 2>&1 || true
-  rm -f "${UNIT_FILE}" "${MTX_UNIT}" 2>/dev/null || true
+  systemctl disable --now rtsp-healthcheck.timer >/dev/null 2>&1 || true
+  rm -f "${UNIT_FILE}" "${MTX_UNIT}" "${HC_SERVICE}" "${HC_TIMER}" 2>/dev/null || true
   systemctl daemon-reload || true
   rm -rf "${RUN_DIR}" 2>/dev/null || true
-  # if partial mediamtx dir exists but no binary, remove it
   [[ -d "${MTX_DIR}" && ! -x "${MTX_BIN}" ]] && rm -rf "${MTX_DIR}"
 }
 
@@ -99,11 +104,49 @@ install_packages(){
   step "Installing packages (ffmpeg + camera apps)"
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -y
-  # If dpkg was interrupted earlier
   dpkg --configure -a || true
-  apt-get install -y --no-install-recommends ffmpeg rpicam-apps || \
-  apt-get install -y --no-install-recommends ffmpeg libcamera-apps
+  apt-get install -y --no-install-recommends curl ca-certificates ffmpeg rpicam-apps || \
+  apt-get install -y --no-install-recommends curl ca-certificates ffmpeg libcamera-apps
   ok "Installed ffmpeg and camera tools"
+}
+
+# ── System polish (GPU mem, Wi-Fi powersave off) ───────────────
+system_polish(){
+  step "Applying system tweaks (GPU mem >=128MB, Wi-Fi powersave off)"
+  local cfg="/boot/firmware/config.txt"
+  if [[ -f "$cfg" ]]; then
+    if ! grep -q '^gpu_mem=' "$cfg"; then
+      echo 'gpu_mem=128' >>"$cfg"
+      ok "Set gpu_mem=128"
+    else
+      local cur; cur="$(grep '^gpu_mem=' "$cfg" | tail -n1 | cut -d= -f2 || echo 0)"
+      if [[ "${cur:-0}" -lt 128 ]]; then
+        sed -i 's/^gpu_mem=.*/gpu_mem=128/' "$cfg"
+        ok "Raised gpu_mem to 128"
+      else
+        ok "gpu_mem already ${cur}"
+      fi
+    fi
+  else
+    err "Could not find ${cfg} (skipping GPU mem tweak)"
+  fi
+
+  # Disable Wi-Fi powersave (NetworkManager if present; else kernel modules)
+  if systemctl is-active --quiet NetworkManager 2>/dev/null; then
+    install -d /etc/NetworkManager/conf.d
+    tee /etc/NetworkManager/conf.d/wifi-powersave.conf >/dev/null <<'EOF'
+[connection]
+wifi.powersave = 2
+EOF
+    systemctl restart NetworkManager || true
+    ok "Wi-Fi powersave disabled via NetworkManager"
+  else
+    tee /etc/modprobe.d/wlan-pm.conf >/dev/null <<'EOF'
+options brcmfmac power_management=off
+options 8192cu rtw_power_mgnt=0
+EOF
+    ok "Wi-Fi powersave disabled via modprobe config"
+  fi
 }
 
 # ── Install MediaMTX v1.14.0 (ARM64/ARMv7) ─────────────────────
@@ -118,22 +161,23 @@ install_mediamtx(){
     URL="https://github.com/bluenviron/mediamtx/releases/download/v1.14.0/mediamtx_v1.14.0_linux_armv7.tar.gz"
   fi
   echo "Downloading: ${URL}"
-  apt-get install -y --no-install-recommends curl ca-certificates
   curl -fL --retry 3 -o "${MTX_DIR}/mediamtx.tgz" "${URL}"
   tar -xzf "${MTX_DIR}/mediamtx.tgz" -C "${MTX_DIR}"
   rm -f "${MTX_DIR}/mediamtx.tgz"
   [[ -x "${MTX_BIN}" ]] || { err "mediamtx binary missing after extract"; exit 1; }
   chmod +x "${MTX_BIN}"
 
-  # TCP-only + wildcard paths (accepts /live and /live.sdp)
+  # TCP-only + timeouts + wildcard paths (accepts /live and /live.sdp)
   cat >"${MTX_CFG}" <<EOF
 rtspAddress: :${PORT}
 protocols: [tcp]
+readTimeout: 10s
+writeTimeout: 10s
 paths:
   "~^.*$": {}
 EOF
 
-  # systemd unit (positional config arg; no -c / -conf)
+  # systemd unit (positional config arg; no -c / -conf) + hardening
   cat >"${MTX_UNIT}" <<EOF
 [Unit]
 Description=MediaMTX RTSP Server
@@ -147,7 +191,20 @@ ExecStart=${MTX_BIN} ${MTX_CFG}
 Restart=always
 RestartSec=2
 LimitNOFILE=65535
-MemoryMax=120M
+MemoryMax=160M
+
+# Hardening
+NoNewPrivileges=yes
+ProtectSystem=full
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+ProtectKernelModules=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
 
 [Install]
 WantedBy=multi-user.target
@@ -250,6 +307,15 @@ MemoryMax=300M
 KillSignal=SIGINT
 TimeoutStopSec=5
 
+# Hardening
+NoNewPrivileges=yes
+ProtectSystem=full
+ProtectHome=yes
+PrivateTmp=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+
 [Install]
 WantedBy=multi-user.target
 EOF
@@ -259,23 +325,67 @@ EOF
   ok "Camera service installed and started"
 }
 
+# ── Health watchdog ────────────────────────────────────────────
+install_healthcheck(){
+  step "Installing health watchdog (restart rtspcam if stream stalls)"
+  tee "${HC_BIN}" >/dev/null <<'EOF'
+#!/usr/bin/env bash
+set -e
+# timeout in microseconds (3s)
+ffprobe -v error -rtsp_transport tcp -timeout 3000000 \
+  rtsp://127.0.0.1:8554/live.sdp -show_streams >/dev/null \
+  || systemctl restart rtspcam
+EOF
+  chmod +x "${HC_BIN}"
+
+  tee "${HC_SERVICE}" >/dev/null <<'EOF'
+[Unit]
+Description=RTSP healthcheck (restart rtspcam on failure)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/rtsp-healthcheck.sh
+EOF
+
+  tee "${HC_TIMER}" >/dev/null <<'EOF'
+[Unit]
+Description=Run RTSP healthcheck every minute
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1min
+AccuracySec=10s
+Unit=rtsp-healthcheck.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  systemctl daemon-reload
+  systemctl enable --now rtsp-healthcheck.timer
+  ok "Health watchdog enabled"
+}
+
 # ── Actions ────────────────────────────────────────────────────
 do_install(){
   banner; require_root; require_apt; cleanup_old
   install_packages
+  system_polish
   install_mediamtx
   install_rtspcam
+  install_healthcheck
 
   local ip; ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
   echo
   ok "Installation complete"
-  echo -e "${ARROW} RTSP URL (current path): ${BOLD}rtsp://${ip:-<pi-ip>}:${PORT}/${PATH_SEGMENT}${RESET}"
-  echo -e "${ARROW} Alternate path also valid: ${BOLD}rtsp://${ip:-<pi-ip>}:${PORT}/live${RESET}"
-  echo -e "${ARROW} Force TCP (for VLC): append ${BOLD}?transport=tcp${RESET}"
+  echo -e "${ARROW} RTSP (live):      ${BOLD}rtsp://${ip:-<pi-ip>}:${PORT}/live${RESET}"
+  echo -e "${ARROW} RTSP (live.sdp):  ${BOLD}rtsp://${ip:-<pi-ip>}:${PORT}/live.sdp${RESET}"
+  echo -e "${ARROW} VLC tip: append ${BOLD}?transport=tcp${RESET}"
   echo
   echo -e "${DIM}Status:${RESET}  systemctl status ${MTX_SERVICE} ${SERVICE_NAME} --no-pager -l"
   echo -e "${DIM}Logs:${RESET}    journalctl -u ${MTX_SERVICE} -u ${SERVICE_NAME} -n 60 --no-pager"
   echo -e "${DIM}Tune:${RESET}    edit /etc/systemd/system/${SERVICE_NAME}.service (WIDTH/HEIGHT/FPS/BITRATE/INTRA) → daemon-reload → restart"
+  echo -e "${DIM}Reboot recommended to apply GPU mem change if modified.${RESET}"
 }
 
 do_status(){ require_root; banner; systemctl --no-pager --full status "${MTX_SERVICE}" || true; echo; systemctl --no-pager --full status "${SERVICE_NAME}" || true; }
@@ -284,7 +394,8 @@ do_uninstall(){
   require_root; banner
   systemctl disable --now "${SERVICE_NAME}" >/dev/null 2>&1 || true
   systemctl disable --now "${MTX_SERVICE}" >/dev/null 2>&1 || true
-  rm -f "${UNIT_FILE}" "${MTX_UNIT}" 2>/dev/null || true
+  systemctl disable --now rtsp-healthcheck.timer >/dev/null 2>&1 || true
+  rm -f "${UNIT_FILE}" "${MTX_UNIT}" "${HC_SERVICE}" "${HC_TIMER}" 2>/dev/null || true
   systemctl daemon-reload
   rm -rf "${RUN_DIR}" "${MTX_DIR}"
   ok "Uninstalled cleanly"
