@@ -1,17 +1,14 @@
 #!/usr/bin/env bash
-# ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
-# ┃  RTSPPI — Installer (Pi Zero 2 W friendly)                  ┃
-# ┃  rpicam-vid/libcamera-vid → ffmpeg (push) → MediaMTX (RTSP) ┃
-# ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
 set -euo pipefail
 
-# ── Appearance ─────────────────────────────────────────────────
+# ── Appearance ────────────────────────────────
 if command -v tput >/dev/null 2>&1 && [[ -t 1 ]]; then
-  BOLD="$(tput bold)"; DIM="$(tput dim)"; RESET="$(tput sgr0)"
-  RED="$(tput setaf 1)"; GREEN="$(tput setaf 2)"; YELLOW="$(tput setaf 3)"; BLUE="$(tput setaf 4)"; CYAN="$(tput setaf 6)"
-else BOLD=""; DIM=""; RESET=""; RED=""; GREEN=""; YELLOW=""; BLUE=""; CYAN=""; fi
-CHECK="${GREEN}✔${RESET}"; CROSS="${RED}✖${RESET}"; ARROW="${CYAN}➜${RESET}"; INFO="${BLUE}ℹ${RESET}"; WARN="${YELLOW}⚠${RESET}"
-banner(){ cat <<'BANNER'
+  BOLD="$(tput bold)"; RESET="$(tput sgr0)"
+  GREEN="$(tput setaf 2)"; RED="$(tput setaf 1)"; CYAN="$(tput setaf 6)"
+else BOLD=""; RESET=""; GREEN=""; RED=""; CYAN=""; fi
+CHECK="${GREEN}✔${RESET}"; CROSS="${RED}✖${RESET}"; ARROW="${CYAN}➜${RESET}"
+
+banner() { cat <<'BANNER'
   _____ _______ _____ _____  _____ _____ 
  |  __ \__   __/ ____|  __ \|  __ \_   _|
  | |__) | | | | (___ | |__) | |__) || |  
@@ -20,125 +17,56 @@ banner(){ cat <<'BANNER'
  |_|  \_\ |_| |_____/|_|    |_|   |_____|
                                          
 BANNER
-echo -e "        ${DIM}RTSP camera for Raspberry Pi (Zero 2 W ready)${RESET}\n"; }
-log(){ echo -e "$1 $2"; }; ok(){ log "${CHECK}" "$1"; }; err(){ log "${CROSS}" "$1"; }; wrn(){ log "${WARN}" "$1"; }; step(){ log "${ARROW}" "${BOLD}$1${RESET}"; }
+echo -e "        RTSP camera for Raspberry Pi (Zero 2 W ready)\n"; }
+log(){ echo -e "$1 $2"; }; ok(){ log "${CHECK}" "$1"; }; step(){ log "${ARROW}" "$1"; }
 
-# ── Defaults & flags ───────────────────────────────────────────
+# ── Defaults ────────────────────────────────
 WIDTH=1280; HEIGHT=720; FPS=25; BITRATE=2000000
 PORT=8554; PATH_SEGMENT="live"
-
 SERVICE_NAME="rtspcam"
 RUN_DIR="/opt/${SERVICE_NAME}"
 RUN_SCRIPT="${RUN_DIR}/run.sh"
 UNIT_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
-
 MTX_SERVICE="mediamtx"
 MTX_DIR="/opt/${MTX_SERVICE}"
 MTX_BIN="${MTX_DIR}/mediamtx"
-MTX_UNIT="/etc/systemd/system/${MTX_SERVICE}.service"
 MTX_CFG="${MTX_DIR}/mediamtx.yml"
+MTX_UNIT="/etc/systemd/system/${MTX_SERVICE}.service"
 
-# If you want to pin/override the MediaMTX download URL, set MEDIAMTX_URL env var before running.
-# Example: MEDIAMTX_URL=https://github.com/.../mediamtx_v1.14.0_linux_arm64.tar.gz sudo bash install_rtspcam.sh
-MEDIAMTX_URL_DEFAULT_ARM64="https://github.com/bluenviron/mediamtx/releases/download/v1.14.0/mediamtx_v1.14.0_linux_arm64.tar.gz"
-MEDIAMTX_URL_DEFAULT_ARMV7="https://github.com/bluenviron/mediamtx/releases/download/v1.14.0/mediamtx_v1.14.0_linux_armv7.tar.gz"
+# ── Helpers ────────────────────────────────
+require_root(){ [[ $EUID -eq 0 ]] || { echo "${CROSS} Run as root"; exit 1; }; }
+arch(){ case "$(uname -m)" in aarch64|arm64) echo "arm64";; armv7l) echo "armv7";; *) echo "arm64";; esac; }
 
-ACTION="install"
-
-print_help(){ cat <<EOF
-${BOLD}RTSPPI Installer${RESET}
-
-Install (default):
-  sudo bash $0 [--width 1280] [--height 720] [--fps 25] [--bitrate 2000000] [--port 8554] [--path live]
-
-Maintenance:
-  sudo bash $0 --status | --restart | --uninstall
-
-Flags:
-  --width N        (default ${WIDTH})
-  --height N       (default ${HEIGHT})
-  --fps N          (default ${FPS})
-  --bitrate N      bits/sec (default ${BITRATE})
-  --port N         RTSP port (default ${PORT})
-  --path NAME      RTSP path (default ${PATH_SEGMENT})
-  -h, --help       Show this help
-
-Env override:
-  MEDIAMTX_URL=<direct tar.gz url>  (e.g. the arm64 link you provided)
-EOF
-}
-
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --width) WIDTH="${2:-}"; shift 2;;
-    --height) HEIGHT="${2:-}"; shift 2;;
-    --fps) FPS="${2:-}"; shift 2;;
-    --bitrate) BITRATE="${2:-}"; shift 2;;
-    --port) PORT="${2:-}"; shift 2;;
-    --path) PATH_SEGMENT="${2:-}"; shift 2;;
-    --status) ACTION="status"; shift;;
-    --restart) ACTION="restart"; shift;;
-    --uninstall) ACTION="uninstall"; shift;;
-    -h|--help) print_help; exit 0;;
-    *) wrn "Unknown arg: $1"; print_help; exit 1;;
-  esac
-done
-
-# ── Helpers ────────────────────────────────────────────────────
-require_root(){ [[ $EUID -eq 0 ]] || { err "Run as root: sudo bash $0"; exit 1; }; }
-require_apt(){ command -v apt-get >/dev/null 2>&1 || { err "Needs apt-get (Debian/Raspberry Pi OS)"; exit 1; }; }
-arch(){
-  case "$(uname -m)" in
-    aarch64|arm64) echo "arm64";;
-    armv7l)        echo "armv7";;
-    *)             echo "arm64";;
-  esac
-}
-
-# ── Cleanup old installs ───────────────────────────────────────
+# ── Cleanup old installs ────────────────────
 cleanup_old(){
-  step "Cleaning up old installations (if any)"
+  step "Cleaning old installations"
   systemctl disable --now "${SERVICE_NAME}" >/dev/null 2>&1 || true
   systemctl disable --now "${MTX_SERVICE}" >/dev/null 2>&1 || true
   rm -f "${UNIT_FILE}" "${MTX_UNIT}" 2>/dev/null || true
   systemctl daemon-reload || true
-  rm -f "${RUN_SCRIPT}" 2>/dev/null || true
-  rmdir "${RUN_DIR}" 2>/dev/null || true
-  [[ -d "${MTX_DIR}" && ! -x "${MTX_BIN}" ]] && rm -rf "${MTX_DIR}"
-  ok "Old units removed"
+  rm -rf "${RUN_DIR}" "${MTX_DIR}" 2>/dev/null || true
 }
 
-# ── Install MediaMTX (uses direct link for your arch, with override) ───────
+# ── Install MediaMTX ────────────────────────
 install_mediamtx(){
-  step "Installing MediaMTX (RTSP server)"
+  step "Installing MediaMTX"
   install -d -m 0755 "${MTX_DIR}"
-  apt-get update -y >/dev/null
-  apt-get install -y --no-install-recommends curl ca-certificates >/dev/null
-
   local A; A="$(arch)"
-  local URL="${MEDIAMTX_URL:-}"
-  if [[ -z "${URL}" ]]; then
-    if [[ "${A}" = "arm64" ]]; then
-      URL="${MEDIAMTX_URL_DEFAULT_ARM64}"
-    else
-      URL="${MEDIAMTX_URL_DEFAULT_ARMV7}"
-    fi
+  local URL
+  if [[ "${A}" = "arm64" ]]; then
+    URL="https://github.com/bluenviron/mediamtx/releases/download/v1.14.0/mediamtx_v1.14.0_linux_arm64.tar.gz"
+  else
+    URL="https://github.com/bluenviron/mediamtx/releases/download/v1.14.0/mediamtx_v1.14.0_linux_armv7.tar.gz"
   fi
-
-  echo "➜ Downloading MediaMTX for ${A}"
-  echo "   ${URL}"
-  curl -fL --retry 3 --connect-timeout 15 -o "${MTX_DIR}/mediamtx.tgz" "${URL}"
+  echo "Downloading: $URL"
+  curl -fL -o "${MTX_DIR}/mediamtx.tgz" "$URL"
   tar -xzf "${MTX_DIR}/mediamtx.tgz" -C "${MTX_DIR}"
   rm -f "${MTX_DIR}/mediamtx.tgz"
-
-  [[ -x "${MTX_BIN}" ]] || { err "mediamtx binary missing after extract"; exit 1; }
   chmod +x "${MTX_BIN}"
 
-  # Minimal config
+  # config
   cat >"${MTX_CFG}" <<EOF
 rtspAddress: :${PORT}
-readTimeout: 10s
-writeTimeout: 10s
 paths:
   ${PATH_SEGMENT}: {}
 EOF
@@ -149,82 +77,53 @@ EOF
 Description=MediaMTX RTSP Server
 After=network-online.target
 Wants=network-online.target
-
 [Service]
 Type=simple
 WorkingDirectory=${MTX_DIR}
-ExecStart=${MTX_BIN} -conf ${MTX_CFG}
+ExecStart=${MTX_BIN} ${MTX_CFG}
 Restart=always
 RestartSec=2
-LimitNOFILE=65535
-MemoryMax=120M
-
 [Install]
 WantedBy=multi-user.target
 EOF
 
   systemctl daemon-reload
-  systemctl enable --now "${MTX_SERVICE}" >/dev/null
-  sleep 1
-  systemctl is-active --quiet "${MTX_SERVICE}" && ok "MediaMTX running on :${PORT}"
+  systemctl enable --now "${MTX_SERVICE}"
+  ok "MediaMTX installed"
 }
 
-# ── Main actions ───────────────────────────────────────────────
-do_install(){
-  banner; require_root; require_apt; cleanup_old
-
-  step "Installing packages (ffmpeg + camera apps)"
-  export DEBIAN_FRONTEND=noninteractive
-  apt-get update -y >/dev/null
-  apt-get install -y --no-install-recommends ffmpeg rpicam-apps || \
-  apt-get install -y --no-install-recommends ffmpeg libcamera-apps
-  ok "Installed ffmpeg and camera tools"
-
-  install_mediamtx
-
-  step "Creating runtime directory"
+# ── Install camera push ─────────────────────
+install_rtspcam(){
+  step "Installing camera push service"
   install -d -m 0755 "${RUN_DIR}"
-
-  step "Writing runner (push to MediaMTX)"
   cat >"${RUN_SCRIPT}" <<'EOS'
 #!/usr/bin/env bash
 set -euo pipefail
+if command -v rpicam-vid >/dev/null 2>&1; then CAMBIN="rpicam-vid";
+elif command -v libcamera-vid >/dev/null 2>&1; then CAMBIN="libcamera-vid";
+else echo "ERROR: No camera binary found." >&2; exit 1; fi
 
-# Pick camera binary
-if command -v rpicam-vid >/dev/null 2>&1; then
-  CAMBIN="rpicam-vid"
-elif command -v libcamera-vid >/dev/null 2>&1; then
-  CAMBIN="libcamera-vid"
-else
-  echo "ERROR: Neither rpicam-vid nor libcamera-vid found." >&2
-  exit 1
-fi
+WIDTH="${WIDTH:-1280}"; HEIGHT="${HEIGHT:-720}"; FPS="${FPS:-25}"
+BITRATE="${BITRATE:-2000000}"; PORT="${PORT:-8554}"; PATH_SEGMENT="${PATH_SEGMENT:-live}"
 
-WIDTH="${WIDTH:-1280}"; HEIGHT="${HEIGHT:-720}"; FPS="${FPS:-25}"; BITRATE="${BITRATE:-2000000}"
-PORT="${PORT:-8554}"; PATH_SEGMENT="${PATH_SEGMENT:-live}"
-
-# Camera → ffmpeg (client) → MediaMTX (server on localhost)
-"$CAMBIN" \
-  -t 0 --inline -n \
+"$CAMBIN" -t 0 --inline -n \
   --width "$WIDTH" --height "$HEIGHT" \
   --framerate "$FPS" --bitrate "$BITRATE" \
   --codec h264 -o - \
 | ffmpeg -hide_banner -loglevel warning \
-  -re -fflags +genpts \
-  -r "$FPS" -i pipe:0 \
-  -c copy \
-  -f rtsp -rtsp_transport tcp \
-  "rtsp://127.0.0.1:${PORT}/${PATH_SEGMENT}"
+    -re -fflags +genpts \
+    -r "$FPS" -i pipe:0 \
+    -c copy \
+    -f rtsp -rtsp_transport tcp \
+    "rtsp://127.0.0.1:${PORT}/${PATH_SEGMENT}"
 EOS
   chmod +x "${RUN_SCRIPT}"
 
-  step "Creating systemd service (camera push)"
   cat >"${UNIT_FILE}" <<EOF
 [Unit]
 Description=RTSP camera (push to MediaMTX)
 After=${MTX_SERVICE}.service
 Wants=${MTX_SERVICE}.service
-
 [Service]
 Type=simple
 ExecStartPre=/bin/sleep 3
@@ -238,48 +137,30 @@ WorkingDirectory=${RUN_DIR}
 ExecStart=/bin/bash -lc '${RUN_SCRIPT}'
 Restart=always
 RestartSec=2
-StartLimitBurst=0
-LimitNOFILE=65535
-MemoryMax=300M
-KillSignal=SIGINT
-TimeoutStopSec=5
-
 [Install]
 WantedBy=multi-user.target
 EOF
 
   systemctl daemon-reload
-  systemctl enable --now "${SERVICE_NAME}" >/dev/null
-  sleep 1
-
-  local ip; ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
-  echo
-  step "All set!"
-  echo -e "${INFO} Stream URL: ${BOLD}rtsp://${ip:-<pi-ip>}:${PORT}/${PATH_SEGMENT}${RESET}"
-  echo -e "${INFO} Server listening: ${BOLD}ss -tlnp | grep ${PORT}${RESET}  ${DIM}(should show mediamtx)${RESET}"
-  echo -e "${INFO} Logs (rtsp):   ${BOLD}journalctl -fu ${MTX_SERVICE}${RESET}"
-  echo -e "${INFO} Logs (camera): ${BOLD}journalctl -fu ${SERVICE_NAME}${RESET}"
-  ok "Done"
+  systemctl enable --now "${SERVICE_NAME}"
+  ok "Camera service installed"
 }
 
-do_status(){ require_root; banner; systemctl --no-pager --full status "${MTX_SERVICE}" || true; echo; systemctl --no-pager --full status "${SERVICE_NAME}" || true; }
-do_restart(){ require_root; banner; systemctl restart "${MTX_SERVICE}"; systemctl restart "${SERVICE_NAME}"; ok "Restarted"; }
-do_uninstall(){
-  require_root; banner
-  systemctl disable --now "${SERVICE_NAME}" >/dev/null 2>&1 || true
-  systemctl disable --now "${MTX_SERVICE}" >/dev/null 2>&1 || true
-  rm -f "${UNIT_FILE}" "${MTX_UNIT}" "${RUN_SCRIPT}" 2>/dev/null || true
-  rmdir "${RUN_DIR}" 2>/dev/null || true
-  rm -rf "${MTX_DIR}"
-  systemctl daemon-reload
-  ok "Uninstalled cleanly"
-}
+# ── Main ────────────────────────────────────
+banner
+require_root
+cleanup_old
 
-trap 'echo -e "\n${CROSS} ${BOLD}Aborted${RESET}"' INT
-case "${ACTION}" in
-  install) do_install ;;
-  status)  do_status ;;
-  restart) do_restart ;;
-  uninstall) do_uninstall ;;
-  *) err "Unknown action: ${ACTION}"; exit 1 ;;
-esac
+step "Installing packages"
+apt-get update -y
+apt-get install -y --no-install-recommends ffmpeg rpicam-apps || \
+apt-get install -y --no-install-recommends ffmpeg libcamera-apps
+ok "Dependencies installed"
+
+install_mediamtx
+install_rtspcam
+
+IP=$(hostname -I | awk "{print \$1}")
+echo
+echo "${CHECK} Installation complete"
+echo "${ARROW} RTSP URL: ${BOLD}rtsp://${IP}:${PORT}/${PATH_SEGMENT}${RESET}"
