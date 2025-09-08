@@ -96,7 +96,8 @@ cleanup_old(){
   rm -f "${UNIT_FILE}" "${MTX_UNIT}" "${HC_SERVICE}" "${HC_TIMER}" 2>/dev/null || true
   systemctl daemon-reload || true
   rm -rf "${RUN_DIR}" 2>/dev/null || true
-  [[ -d "${MTX_DIR}" && ! -x "${MTX_BIN}" ]] && rm -rf "${MTX_DIR}"
+  [[ -d "${MTX_DIR}" && ! -x "${MTX_BIN}" ]] && rm -rf "${MTX_DIR}" || true
+  ok "Old installations cleaned"
 }
 
 # ── Install packages ───────────────────────────────────────────
@@ -112,7 +113,7 @@ install_packages(){
 
 # ── System polish (GPU mem, Wi-Fi powersave off) ───────────────
 system_polish(){
-  step "Applying system tweaks (GPU mem >=128MB, Wi-Fi powersave off)"
+  step "Applying system tweaks (GPU mem ≥128MB, Wi-Fi powersave off)"
   local cfg="/boot/firmware/config.txt"
   if [[ -f "$cfg" ]]; then
     if ! grep -q '^gpu_mem=' "$cfg"; then
