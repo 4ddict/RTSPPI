@@ -74,34 +74,33 @@ cleanup_old(){
   systemctl daemon-reload || true
   rm -f "${RUN_SCRIPT}" 2>/dev/null || true
   rmdir "${RUN_DIR}" 2>/dev/null || true
-  # if partial mediamtx dir exists but no binary, blow it away
   [[ -d "${MTX_DIR}" && ! -x "${MTX_BIN}" ]] && rm -rf "${MTX_DIR}"
   ok "Old units removed"
 }
 
-# ── Fetch latest MediaMTX (scrape releases page) ───────────────
-# Finds first matching URL for our arch, tries .tar.gz then .zip, extracts it.
+# ── Install MediaMTX (download OR build-from-source fallback) ──
 install_mediamtx(){
   step "Installing MediaMTX (RTSP server)"
   install -d -m 0755 "${MTX_DIR}"
   apt-get update -y >/dev/null
   apt-get install -y --no-install-recommends curl ca-certificates unzip >/dev/null
 
-  local ARCH="$(arch_name)"                 # arm64 or armv7
+  local ARCH="$(arch_name)"
   local PAGE
-  PAGE="$(curl -fsSL https://github.com/bluenviron/mediamtx/releases)" || { err "Cannot reach releases page"; exit 1; }
+  # Try scraping releases for a matching asset (works when naming is stable)
+  if curl -fsSL https://github.com/bluenviron/mediamtx/releases -o /tmp/mediamtx.releases.html ; then
+    PAGE="$(cat /tmp/mediamtx.releases.html)"
+  else
+    PAGE=""
+  fi
 
-  # Look for assets like mediamtx_vX.Y.Z_linux_arm64.tar.gz (or armv7)
-  # 1) tar.gz preferred
-  local URL_TGZ
-  URL_TGZ="$(echo "$PAGE" | grep -Eo "https://github.com/bluenviron/mediamtx/releases/download/[^/]+/mediamtx_v[0-9\.]+_linux_${ARCH}\.tar\.gz" | head -n1 || true)"
-  # 2) fallback to .zip
-  local URL_ZIP
-  URL_ZIP="$(echo "$PAGE" | grep -Eo "https://github.com/bluenviron/mediamtx/releases/download/[^/]+/mediamtx_v[0-9\.]+_linux_${ARCH}\.zip" | head -n1 || true)"
-
-  if [[ -z "${URL_TGZ}" && -z "${URL_ZIP}" ]]; then
-    # try legacy arm64v8 naming if arm64
-    if [[ "${ARCH}" = "arm64" ]]; then
+  local URL_TGZ="" URL_ZIP=""
+  if [[ -n "$PAGE" ]]; then
+    # Preferred current naming: mediamtx_vX.Y.Z_linux_arm64(.tar.gz|.zip) or armv7
+    URL_TGZ="$(echo "$PAGE" | grep -Eo "https://github.com/bluenviron/mediamtx/releases/download/[^/]+/mediamtx_v[0-9\.]+_linux_${ARCH}\.tar\.gz" | head -n1 || true)"
+    URL_ZIP="$(echo "$PAGE" | grep -Eo "https://github.com/bluenviron/mediamtx/releases/download/[^/]+/mediamtx_v[0-9\.]+_linux_${ARCH}\.zip" | head -n1 || true)"
+    # Legacy arm64v8 fallback if nothing found
+    if [[ -z "$URL_TGZ$URL_ZIP" && "${ARCH}" = "arm64" ]]; then
       URL_TGZ="$(echo "$PAGE" | grep -Eo "https://github.com/bluenviron/mediamtx/releases/download/[^/]+/mediamtx_v[0-9\.]+_linux_arm64v8\.tar\.gz" | head -n1 || true)"
       URL_ZIP="$(echo "$PAGE" | grep -Eo "https://github.com/bluenviron/mediamtx/releases/download/[^/]+/mediamtx_v[0-9\.]+_linux_arm64v8\.zip" | head -n1 || true)"
     fi
@@ -116,11 +115,14 @@ install_mediamtx(){
     curl -fsSL --retry 3 -o "${MTX_DIR}/mediamtx.zip" "${URL_ZIP}"
     unzip -o "${MTX_DIR}/mediamtx.zip" -d "${MTX_DIR}" >/dev/null
   else
-    err "No MediaMTX asset found for ${ARCH}. Please download manually from releases."
-    exit 1
+    wrn "No prebuilt MediaMTX asset found for ${ARCH}. Falling back to building from source."
+    # Build from source with Go (fast & reliable on Pi)
+    apt-get install -y --no-install-recommends golang git >/dev/null
+    # Use module install; place binary directly in /opt/mediamtx
+    GOBIN="${MTX_DIR}" CGO_ENABLED=0 go install github.com/bluenviron/mediamtx@latest
   fi
 
-  [[ -x "${MTX_BIN}" ]] || { err "mediamtx binary missing after extract"; exit 1; }
+  [[ -x "${MTX_BIN}" ]] || { err "mediamtx binary missing after install"; exit 1; }
   chmod +x "${MTX_BIN}"
 
   # Minimal config
@@ -181,7 +183,7 @@ set -euo pipefail
 # Pick camera binary
 if command -v rpicam-vid >/dev/null 2>&1; then
   CAMBIN="rpicam-vid"
-elif command -v libcamera-vid >/devnull 2>&1; then
+elif command -v libcamera-vid >/dev/null 2>&1; then
   CAMBIN="libcamera-vid"
 else
   echo "ERROR: Neither rpicam-vid nor libcamera-vid found." >&2
