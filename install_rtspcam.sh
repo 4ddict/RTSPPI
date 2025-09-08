@@ -35,7 +35,7 @@ banner() {
 BANNER
   echo -e "        ${DIM}RTSP camera for Raspberry Pi (Zero 2 W ready)${RESET}\n"
 }
-log(){ echo -e "$1 $2"; }; ok(){ log "${CHECK}" "$1"; }; err(){ log "${CROSS}" "$1"; }; step(){ log "${ARROW}" "${BOLD}$1${RESET}"; }
+log(){ echo -e "$1 $2"; }; ok(){ log "${CHECK}" "$1"; }; err(){ log "${CROSS}" "$1"; }; wrn(){ log "${WARN}" "$1"; }; step(){ log "${ARROW}" "${BOLD}$1${RESET}"; }
 
 # ─────────────────────── Defaults & Flags ──────────────────────
 WIDTH=1280; HEIGHT=720; FPS=25; BITRATE=2000000
@@ -89,7 +89,7 @@ while [[ $# -gt 0 ]]; do
     --restart) ACTION="restart"; shift;;
     --uninstall) ACTION="uninstall"; shift;;
     -h|--help) print_help; exit 0;;
-    *) err "Unknown argument: $1"; print_help; exit 1;;
+    *) wrn "Unknown argument: $1"; print_help; exit 1;;
   esac
 done
 
@@ -104,38 +104,74 @@ arch_tag(){
   esac
 }
 
+# ───────────── Cleanup: stop old services, remove stale files ─────────────
+cleanup_old() {
+  step "Cleaning up old installations (if any)"
+  systemctl disable --now "${SERVICE_NAME}" >/dev/null 2>&1 || true
+  systemctl disable --now "${MTX_SERVICE}" >/dev/null 2>&1 || true
+  # Remove old units and reload
+  rm -f "${UNIT_FILE}" "${MTX_UNIT}" 2>/dev/null || true
+  systemctl daemon-reload || true
+
+  # Remove old runner / dirs if clearly ours
+  if [[ -d "${RUN_DIR}" ]]; then
+    rm -f "${RUN_SCRIPT}" 2>/dev/null || true
+    rmdir "${RUN_DIR}" 2>/dev/null || true
+  fi
+
+  # If MediaMTX dir exists but looks broken (no binary), clear it
+  if [[ -d "${MTX_DIR}" && ! -x "${MTX_BIN}" ]]; then
+    rm -rf "${MTX_DIR}"
+  fi
+  ok "Old services disabled and stale files cleaned"
+}
+
 # ─────────────────────── Install MediaMTX ──────────────────────
 install_mediamtx() {
   step "Installing MediaMTX (RTSP server)"
   install -d -m 0755 "${MTX_DIR}"
   local TAG="$(arch_tag)"
-  # Try to fetch latest release; fallback to a known path if API blocked
-  if command -v curl >/dev/null 2>&1; then
-    local URL
-    URL="$(curl -s https://api.github.com/repos/bluenviron/mediamtx/releases/latest \
-        | grep browser_download_url | grep "${TAG}.tar.gz" | head -n1 | cut -d '"' -f 4 || true)"
-    if [[ -z "${URL:-}" ]]; then
-      URL="https://github.com/bluenviron/mediamtx/releases/latest/download/mediamtx_${TAG}.tar.gz"
+  local URL_TGZ="https://github.com/bluenviron/mediamtx/releases/latest/download/mediamtx_${TAG}.tar.gz"
+  local URL_ZIP="https://github.com/bluenviron/mediamtx/releases/latest/download/mediamtx_${TAG}.zip"
+
+  apt-get update -y >/dev/null
+  apt-get install -y --no-install-recommends curl ca-certificates unzip >/dev/null
+
+  # Clean previous artifacts
+  rm -f "${MTX_DIR}/mediamtx" "${MTX_DIR}/mediamtx.tar.gz" "${MTX_DIR}/mediamtx.zip" 2>/dev/null || true
+
+  local downloaded=false
+  echo "➜ Trying ${URL_TGZ}"
+  if curl -fsSL --retry 3 --connect-timeout 10 -o "${MTX_DIR}/mediamtx.tar.gz" "${URL_TGZ}"; then
+    if tar -xzf "${MTX_DIR}/mediamtx.tar.gz" -C "${MTX_DIR}" 2>/dev/null; then
+      downloaded=true
+    else
+      echo "tar extraction failed; will try zip…"
     fi
-    curl -L "${URL}" -o "${MTX_DIR}/mediamtx.tar.gz"
-  else
-    apt-get update -y >/dev/null
-    apt-get install -y --no-install-recommends curl >/dev/null
-    install_mediamtx; return
   fi
-  tar -xzf "${MTX_DIR}/mediamtx.tar.gz" -C "${MTX_DIR}"
-  rm -f "${MTX_DIR}/mediamtx.tar.gz"
+
+  if ! $downloaded; then
+    echo "➜ Trying ${URL_ZIP}"
+    if curl -fsSL --retry 3 --connect-timeout 10 -o "${MTX_DIR}/mediamtx.zip" "${URL_ZIP}"; then
+      unzip -o "${MTX_DIR}/mediamtx.zip" -d "${MTX_DIR}" >/dev/null
+      downloaded=true
+    fi
+  fi
+
+  if ! $downloaded || [[ ! -x "${MTX_BIN}" ]]; then
+    err "Could not fetch MediaMTX for $(uname -m). Grab it manually from https://github.com/bluenviron/mediamtx/releases"
+    exit 1
+  fi
+
   chmod +x "${MTX_BIN}"
 
-  # Minimal config: listen on ${PORT}, allow publishing/reading
+  # Minimal config: listen on ${PORT}, open path ${PATH_SEGMENT}
   cat >"${MTX_CFG}" <<EOF
 rtspAddress: :${PORT}
 readTimeout: 10s
 writeTimeout: 10s
-authMethods: [basic, digest]
 paths:
-  ${PATH_SEGMENT}:
-    # no auth by default; add 'publishUser'/'publishPass' later if desired
+  ${PATH_SEGMENT}: {}
 EOF
 
   # systemd unit for MediaMTX
@@ -148,7 +184,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=${MTX_DIR}
-ExecStart=${MTX_BIN}
+ExecStart=${MTX_BIN} ${MTX_CFG:+-conf ${MTX_CFG}}
 Restart=always
 RestartSec=2
 LimitNOFILE=65535
@@ -168,6 +204,7 @@ EOF
 do_install() {
   banner
   require_root; require_apt
+  cleanup_old
 
   step "Installing packages (ffmpeg + camera apps)"
   export DEBIAN_FRONTEND=noninteractive
@@ -204,7 +241,7 @@ PORT="${PORT:-8554}"
 PATH_SEGMENT="${PATH_SEGMENT:-live}"
 
 # Camera → ffmpeg (client) → MediaMTX (server on localhost)
-"${CAMBIN}" \
+"$CAMBIN" \
   -t 0 --inline -n \
   --width "$WIDTH" --height "$HEIGHT" \
   --framerate "$FPS" --bitrate "$BITRATE" \
@@ -262,9 +299,9 @@ EOF
   step "All set!"
   local ip; ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
   echo -e "${INFO} Stream URL: ${BOLD}rtsp://${ip:-<pi-ip>}:${PORT}/${PATH_SEGMENT}${RESET}"
-  echo -e "${INFO} Check server: ${BOLD}ss -tlnp | grep ${PORT}${RESET}   ${DIM}(should show mediamtx listening)${RESET}"
+  echo -e "${INFO} Server listening: ${BOLD}ss -tlnp | grep ${PORT}${RESET}   ${DIM}(should show mediamtx)${RESET}"
   echo -e "${INFO} Logs (camera): ${BOLD}journalctl -fu ${SERVICE_NAME}${RESET}"
-  echo -e "${INFO} Logs (rtsp):   ${BOLD}journalctl -fu ${MTX_SERVICE}${RESET}"
+  echo -e "${INFO} Logs (RTSP):   ${BOLD}journalctl -fu ${MTX_SERVICE}${RESET}"
   ok "Done"
 }
 
@@ -285,14 +322,16 @@ do_restart() {
 
 do_uninstall() {
   require_root; banner
-  step "Stopping services"
+  step "Stopping & disabling services"
   systemctl disable --now "${SERVICE_NAME}" >/dev/null || true
   systemctl disable --now "${MTX_SERVICE}" >/dev/null || true
+
   step "Removing files"
   rm -f "${UNIT_FILE}" "${MTX_UNIT}"
   rm -f "${RUN_SCRIPT}"
   rmdir "${RUN_DIR}" 2>/dev/null || true
   rm -rf "${MTX_DIR}"
+
   systemctl daemon-reload
   ok "Uninstalled cleanly"
 }
