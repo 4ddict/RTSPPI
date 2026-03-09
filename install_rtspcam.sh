@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# RTSPPI installer (optimized / idempotent)
+# ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+# ┃ RTSPPI — Optimized Installer                              ┃
+# ┃ rpicam-vid/libcamera-vid → ffmpeg (push) → MediaMTX      ┃
+# ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
 
 # -----------------------------
-# Config (override via env)
+# Config (override via env vars)
 # -----------------------------
 WIDTH="${WIDTH:-1280}"
 HEIGHT="${HEIGHT:-720}"
@@ -13,6 +16,7 @@ BITRATE="${BITRATE:-2000000}"
 INTRA="${INTRA:-15}"
 PORT="${PORT:-8554}"
 PATH_SEGMENT="${PATH_SEGMENT:-live.sdp}"
+
 SERVICE_NAME="rtspcam"
 RUN_DIR="/opt/${SERVICE_NAME}"
 RUN_SCRIPT="${RUN_DIR}/run.sh"
@@ -23,17 +27,21 @@ MTX_DIR="/opt/${MTX_SERVICE}"
 MTX_BIN="${MTX_DIR}/mediamtx"
 MTX_CFG="${MTX_DIR}/mediamtx.yml"
 MTX_UNIT="/etc/systemd/system/${MTX_SERVICE}.service"
-MTX_VERSION="${MTX_VERSION:-v1.16.3}"   # bumpable without editing logic
+MTX_VERSION="${MTX_VERSION:-v1.16.3}"
 MTX_VERSION_FILE="${MTX_DIR}/.installed-version"
 
-HC_BIN="/usr/local/bin/rtsp-healthcheck.sh"
-HC_SERVICE="/etc/systemd/system/rtsp-healthcheck.service"
-HC_TIMER="/etc/systemd/system/rtsp-healthcheck.timer"
+HC_NAME="rtsp-healthcheck"
+HC_BIN="/usr/local/bin/${HC_NAME}.sh"
+HC_SERVICE="/etc/systemd/system/${HC_NAME}.service"
+HC_TIMER="/etc/systemd/system/${HC_NAME}.timer"
+HC_INTERVAL="${HC_INTERVAL:-1min}"
+HC_BOOT_DELAY="${HC_BOOT_DELAY:-2min}"
+HC_TIMEOUT_US="${HC_TIMEOUT_US:-3000000}"
 
 ACTION="${1:-install}"
 
 # -----------------------------
-# UI
+# Appearance
 # -----------------------------
 if command -v tput >/dev/null 2>&1 && [[ -t 1 ]]; then
   BOLD="$(tput bold)"
@@ -43,29 +51,34 @@ if command -v tput >/dev/null 2>&1 && [[ -t 1 ]]; then
   RED="$(tput setaf 1)"
   CYAN="$(tput setaf 6)"
 else
-  BOLD="" DIM="" RESET="" GREEN="" RED="" CYAN=""
+  BOLD=""
+  DIM=""
+  RESET=""
+  GREEN=""
+  RED=""
+  CYAN=""
 fi
 
 CHECK="${GREEN}✔${RESET}"
 CROSS="${RED}✖${RESET}"
 ARROW="${CYAN}➜${RESET}"
 
-log()  { printf '%b %s\n' "$1" "$2"; }
-ok()   { log "${CHECK}" "$1"; }
-step() { log "${ARROW}" "$1"; }
-err()  { log "${CROSS}" "$1" >&2; }
-
 banner() {
-  cat <<'EOF'
+  cat <<'BANNER'
  _____ _______ _____ _____ _____ _____
 |  __ \__   __/ ____|  __ \|  __ \_   _|
 | |__) | | | | (___ | |__) | |__) || |
 |  _  /  | |  \___ \|  ___/|  ___/ | |
 | | \ \  | |  ____) | |    | |    _| |_
 |_|  \_\ |_| |_____/|_|    |_|   |_____|
-EOF
+BANNER
   printf '%bRTSP camera for Raspberry Pi (optimized installer)%b\n\n' "${DIM}" "${RESET}"
 }
+
+log()  { printf '%b %s\n' "$1" "$2"; }
+ok()   { log "${CHECK}" "$1"; }
+step() { log "${ARROW}" "$1"; }
+err()  { log "${CROSS}" "$1" >&2; }
 
 # -----------------------------
 # Helpers
@@ -90,7 +103,7 @@ require_systemd() {
 detect_arch() {
   case "$(uname -m)" in
     aarch64|arm64) echo "arm64" ;;
-    armv7l)        echo "armv7" ;;
+    armv7l) echo "armv7" ;;
     *)
       err "Unsupported architecture: $(uname -m)"
       exit 1
@@ -115,29 +128,6 @@ write_if_changed() {
   return 1
 }
 
-need_restart=false
-need_daemon_reload=false
-
-mark_restart() {
-  need_restart=true
-}
-
-mark_daemon_reload() {
-  need_daemon_reload=true
-}
-
-reload_systemd_if_needed() {
-  if [[ "$need_daemon_reload" == true ]]; then
-    systemctl daemon-reload
-  fi
-}
-
-restart_services_if_needed() {
-  if [[ "$need_restart" == true ]]; then
-    systemctl restart "${MTX_SERVICE}" "${SERVICE_NAME}"
-  fi
-}
-
 pkg_installed() {
   dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q "install ok installed"
 }
@@ -154,6 +144,7 @@ apt_install_missing() {
     step "Installing packages: ${pkgs[*]}"
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -y
+    dpkg --configure -a || true
     apt-get install -y --no-install-recommends "${pkgs[@]}"
   else
     ok "Required packages already installed"
@@ -184,16 +175,53 @@ set_key_value_in_file() {
   fi
 }
 
-service_enabled() {
-  systemctl is-enabled "$1" >/dev/null 2>&1
+need_restart=false
+need_daemon_reload=false
+
+mark_restart() {
+  need_restart=true
 }
 
-service_active() {
-  systemctl is-active "$1" >/dev/null 2>&1
+mark_daemon_reload() {
+  need_daemon_reload=true
+}
+
+reload_systemd_if_needed() {
+  if [[ "$need_daemon_reload" == true ]]; then
+    systemctl daemon-reload
+    need_daemon_reload=false
+  fi
+}
+
+restart_services_if_needed() {
+  if [[ "$need_restart" == true ]]; then
+    systemctl restart "${MTX_SERVICE}" "${SERVICE_NAME}"
+    need_restart=false
+  fi
+}
+
+print_help() {
+  cat <<EOF
+Usage:
+  sudo bash $0 install
+  sudo bash $0 status
+  sudo bash $0 restart
+  sudo bash $0 uninstall
+
+Optional environment overrides:
+  WIDTH HEIGHT FPS BITRATE INTRA PORT PATH_SEGMENT
+  MTX_VERSION
+  HC_INTERVAL HC_BOOT_DELAY HC_TIMEOUT_US
+
+Examples:
+  sudo WIDTH=1920 HEIGHT=1080 FPS=30 BITRATE=4000000 bash $0 install
+  sudo PORT=8555 PATH_SEGMENT=cam.sdp bash $0 install
+  sudo MTX_VERSION=v1.16.3 bash $0 install
+EOF
 }
 
 # -----------------------------
-# Install steps
+# Install packages
 # -----------------------------
 install_packages() {
   step "Installing dependencies"
@@ -205,7 +233,6 @@ install_packages() {
     return
   fi
 
-  # Prefer current naming first, fallback to old naming
   if apt-cache show rpicam-apps >/dev/null 2>&1; then
     apt_install_missing rpicam-apps || apt_install_missing libcamera-apps
   else
@@ -220,17 +247,27 @@ install_packages() {
   fi
 }
 
+# -----------------------------
+# System polish
+# -----------------------------
 system_polish() {
   step "Applying system tweaks"
 
-  local changed=false
   local cfg="/boot/firmware/config.txt"
 
   if [[ -f "$cfg" ]]; then
-    if set_key_value_in_file "$cfg" "gpu_mem" "128"; then
-      ok "Ensured gpu_mem=128"
+    if ! grep -q '^gpu_mem=' "$cfg"; then
+      echo 'gpu_mem=128' >>"$cfg"
+      ok "Set gpu_mem=128"
     else
-      ok "gpu_mem already configured"
+      local cur
+      cur="$(grep '^gpu_mem=' "$cfg" | tail -n1 | cut -d= -f2 || echo 0)"
+      if [[ "${cur:-0}" -lt 128 ]]; then
+        sed -i 's/^gpu_mem=.*/gpu_mem=128/' "$cfg"
+        ok "Raised gpu_mem to 128"
+      else
+        ok "gpu_mem already ${cur}"
+      fi
     fi
   else
     err "Could not find ${cfg}, skipping GPU memory tweak"
@@ -260,6 +297,9 @@ EOF
   fi
 }
 
+# -----------------------------
+# Install MediaMTX
+# -----------------------------
 install_mediamtx() {
   step "Installing MediaMTX"
 
@@ -332,6 +372,9 @@ EOF
   systemctl enable --now "${MTX_SERVICE}"
 }
 
+# -----------------------------
+# Install RTSP runner
+# -----------------------------
 install_rtspcam() {
   step "Installing RTSP camera runner"
 
@@ -378,7 +421,7 @@ wait_for_port 127.0.0.1 "${PORT}" 60 || die "RTSP server not reachable on 127.0.
 trap 'pkill -P $$ >/dev/null 2>&1 || true' INT TERM EXIT
 
 while true; do
-  log "Starting ${WIDTH}x${HEIGHT}@${FPS} -> rtsp://127.0.0.1:${PORT}/${PATH_SEGMENT}"
+  log "Starting push -> rtsp://127.0.0.1:${PORT}/${PATH_SEGMENT} (${WIDTH}x${HEIGHT}@${FPS}, ${BITRATE}bps, intra=${INTRA})"
 
   "$CAMBIN" \
     -t 0 --inline -n \
@@ -406,7 +449,7 @@ while true; do
       "rtsp://127.0.0.1:${PORT}/${PATH_SEGMENT}"
 
   rc=$?
-  log "Pipeline exited with code ${rc}; restarting in 2s"
+  log "Pipeline exited (code ${rc}). Restarting in 2s..."
   sleep 2
 done
 EOF
@@ -453,20 +496,23 @@ EOF
   systemctl enable --now "${SERVICE_NAME}"
 }
 
+# -----------------------------
+# Install healthcheck
+# -----------------------------
 install_healthcheck() {
   step "Installing healthcheck"
 
-  if write_if_changed "${HC_BIN}" 0755 <<'EOF'
+  if write_if_changed "${HC_BIN}" 0755 <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
 
 ffprobe \
   -v error \
   -rtsp_transport tcp \
-  -timeout 3000000 \
-  rtsp://127.0.0.1:8554/live.sdp \
+  -timeout ${HC_TIMEOUT_US} \
+  rtsp://127.0.0.1:${PORT}/${PATH_SEGMENT} \
   -show_streams >/dev/null \
-  || systemctl restart rtspcam
+  || systemctl restart ${SERVICE_NAME}
 EOF
   then
     ok "Updated healthcheck script"
@@ -474,13 +520,13 @@ EOF
     ok "Healthcheck script unchanged"
   fi
 
-  if write_if_changed "${HC_SERVICE}" 0644 <<'EOF'
+  if write_if_changed "${HC_SERVICE}" 0644 <<EOF
 [Unit]
-Description=RTSP healthcheck (restart rtspcam on failure)
+Description=RTSP healthcheck (restart ${SERVICE_NAME} on failure)
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/bin/rtsp-healthcheck.sh
+ExecStart=${HC_BIN}
 EOF
   then
     ok "Updated healthcheck service"
@@ -489,15 +535,15 @@ EOF
     ok "Healthcheck service unchanged"
   fi
 
-  if write_if_changed "${HC_TIMER}" 0644 <<'EOF'
+  if write_if_changed "${HC_TIMER}" 0644 <<EOF
 [Unit]
-Description=Run RTSP healthcheck every minute
+Description=Run RTSP healthcheck on interval
 
 [Timer]
-OnBootSec=2min
-OnUnitActiveSec=1min
+OnBootSec=${HC_BOOT_DELAY}
+OnUnitActiveSec=${HC_INTERVAL}
 AccuracySec=10s
-Unit=rtsp-healthcheck.service
+Unit=${HC_NAME}.service
 
 [Install]
 WantedBy=timers.target
@@ -510,7 +556,7 @@ EOF
   fi
 
   reload_systemd_if_needed
-  systemctl enable --now rtsp-healthcheck.timer
+  systemctl enable --now "${HC_NAME}.timer"
 }
 
 # -----------------------------
@@ -533,10 +579,14 @@ do_install() {
   ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
 
   ok "Installation complete"
-  printf '\n'
+  echo
   printf '%b RTSP (live): %brtsp://%s:%s/live%b\n' "${ARROW}" "${BOLD}" "${ip:-<ip>}" "${PORT}" "${RESET}"
   printf '%b RTSP (live.sdp): %brtsp://%s:%s/live.sdp%b\n' "${ARROW}" "${BOLD}" "${ip:-<ip>}" "${PORT}" "${RESET}"
   printf '%b VLC tip: append %b?transport=tcp%b\n' "${ARROW}" "${BOLD}" "${RESET}"
+  echo
+  printf '%bStatus:%b systemctl status %s %s --no-pager -l\n' "${DIM}" "${RESET}" "${MTX_SERVICE}" "${SERVICE_NAME}"
+  printf '%bLogs:%b journalctl -u %s -u %s -n 60 --no-pager\n' "${DIM}" "${RESET}" "${MTX_SERVICE}" "${SERVICE_NAME}"
+  printf '%bReboot recommended%b if gpu_mem changed.\n' "${DIM}" "${RESET}"
 }
 
 do_status() {
@@ -546,13 +596,13 @@ do_status() {
   echo
   systemctl --no-pager --full status "${SERVICE_NAME}" || true
   echo
-  systemctl --no-pager --full status rtsp-healthcheck.timer || true
+  systemctl --no-pager --full status "${HC_NAME}.timer" || true
 }
 
 do_restart() {
   banner
   require_root
-  systemctl restart "${MTX_SERVICE}" "${SERVICE_NAME}" rtsp-healthcheck.timer
+  systemctl restart "${MTX_SERVICE}" "${SERVICE_NAME}" "${HC_NAME}.timer"
   ok "Restarted services"
 }
 
@@ -562,7 +612,7 @@ do_uninstall() {
 
   systemctl disable --now "${SERVICE_NAME}" >/dev/null 2>&1 || true
   systemctl disable --now "${MTX_SERVICE}" >/dev/null 2>&1 || true
-  systemctl disable --now rtsp-healthcheck.timer >/dev/null 2>&1 || true
+  systemctl disable --now "${HC_NAME}.timer" >/dev/null 2>&1 || true
 
   rm -f "${UNIT_FILE}" "${MTX_UNIT}" "${HC_SERVICE}" "${HC_TIMER}" "${HC_BIN}"
   rm -rf "${RUN_DIR}" "${MTX_DIR}"
@@ -578,8 +628,10 @@ case "${ACTION}" in
   status)    do_status ;;
   restart)   do_restart ;;
   uninstall) do_uninstall ;;
+  help|-h|--help) print_help ;;
   *)
     err "Unknown action: ${ACTION}"
+    print_help
     exit 1
     ;;
 esac
