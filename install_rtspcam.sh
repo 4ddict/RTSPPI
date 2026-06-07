@@ -37,6 +37,8 @@ HC_TIMER="/etc/systemd/system/${HC_NAME}.timer"
 HC_INTERVAL="${HC_INTERVAL:-1min}"
 HC_BOOT_DELAY="${HC_BOOT_DELAY:-2min}"
 HC_TIMEOUT_US="${HC_TIMEOUT_US:-3000000}"
+HC_FAILURES="${HC_FAILURES:-2}"
+PREVENTIVE_RESTART_SEC="${PREVENTIVE_RESTART_SEC:-12h}"
 
 ACTION="${1:-install}"
 
@@ -211,11 +213,12 @@ Usage:
 Optional environment overrides:
   WIDTH HEIGHT FPS BITRATE INTRA PORT PATH_SEGMENT
   MTX_VERSION
-  HC_INTERVAL HC_BOOT_DELAY HC_TIMEOUT_US
+  HC_INTERVAL HC_BOOT_DELAY HC_TIMEOUT_US HC_FAILURES PREVENTIVE_RESTART_SEC
 
 Examples:
   sudo WIDTH=1920 HEIGHT=1080 FPS=30 BITRATE=4000000 bash $0 install
   sudo PORT=8555 PATH_SEGMENT=cam.sdp bash $0 install
+  sudo PREVENTIVE_RESTART_SEC=24h HC_FAILURES=3 bash $0 install
   sudo MTX_VERSION=v1.16.3 bash $0 install
 EOF
 }
@@ -423,6 +426,7 @@ trap 'pkill -P $$ >/dev/null 2>&1 || true' INT TERM EXIT
 while true; do
   log "Starting push -> rtsp://127.0.0.1:${PORT}/${PATH_SEGMENT} (${WIDTH}x${HEIGHT}@${FPS}, ${BITRATE}bps, intra=${INTRA})"
 
+  set +e
   "$CAMBIN" \
     -t 0 --inline -n \
     --width "${WIDTH}" \
@@ -449,6 +453,7 @@ while true; do
       "rtsp://127.0.0.1:${PORT}/${PATH_SEGMENT}"
 
   rc=$?
+  set -e
   log "Pipeline exited (code ${rc}). Restarting in 2s..."
   sleep 2
 done
@@ -466,6 +471,7 @@ Description=RTSP camera push pipeline
 After=network-online.target ${MTX_SERVICE}.service
 Wants=network-online.target
 Requires=${MTX_SERVICE}.service
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -478,7 +484,8 @@ Environment=PORT=${PORT}
 Environment=PATH_SEGMENT=${PATH_SEGMENT}
 ExecStart=${RUN_SCRIPT}
 Restart=always
-RestartSec=2
+RestartSec=5
+RuntimeMaxSec=${PREVENTIVE_RESTART_SEC}
 KillMode=control-group
 
 [Install]
@@ -506,13 +513,32 @@ install_healthcheck() {
 #!/usr/bin/env bash
 set -euo pipefail
 
-ffprobe \
+STATE_DIR="/run/${HC_NAME}"
+FAIL_FILE="\${STATE_DIR}/failures"
+
+mkdir -p "\${STATE_DIR}"
+
+if ffprobe \
   -v error \
   -rtsp_transport tcp \
   -timeout ${HC_TIMEOUT_US} \
   rtsp://127.0.0.1:${PORT}/${PATH_SEGMENT} \
-  -show_streams >/dev/null \
-  || systemctl restart ${SERVICE_NAME}
+  -show_streams >/dev/null; then
+  rm -f "\${FAIL_FILE}"
+  exit 0
+fi
+
+failures=1
+if [[ -f "\${FAIL_FILE}" ]]; then
+  read -r failures <"\${FAIL_FILE}" || failures=0
+  failures=\$((failures + 1))
+fi
+printf '%s\n' "\${failures}" >"\${FAIL_FILE}"
+
+if (( failures >= ${HC_FAILURES} )); then
+  rm -f "\${FAIL_FILE}"
+  systemctl restart ${MTX_SERVICE} ${SERVICE_NAME}
+fi
 EOF
   then
     ok "Updated healthcheck script"
